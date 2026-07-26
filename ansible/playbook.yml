@@ -3,6 +3,11 @@
   hosts: all
   become: true
 
+  vars:
+    domain: "www.faizun.hepttech.com"
+    domain_alt: "faizun.hepttech.com"
+    app_port: 8000
+
   tasks:
     - name: Wait for SSH to be ready
       ansible.builtin.wait_for_connection:
@@ -11,7 +16,12 @@
 
     - name: Install runtime packages
       ansible.builtin.apt:
-        name: [python3-venv, python3-pip, nginx]
+        name:
+          - python3-venv
+          - python3-pip
+          - nginx
+          - certbot
+          - python3-certbot-nginx
         state: present
         update_cache: true
       retries: 5
@@ -58,7 +68,7 @@
 
           [Service]
           WorkingDirectory=/opt/app
-          ExecStart=/opt/app/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+          ExecStart=/opt/app/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port {{ app_port }}
           Restart=always
           RestartSec=5
 
@@ -68,24 +78,38 @@
         - Reload systemd
         - Restart app
 
-    - name: Install nginx site
+    # ── nginx: HTTP-only vhost first so certbot can complete the HTTP-01 challenge ──
+    - name: Install nginx site (HTTP only — pre-cert)
       ansible.builtin.copy:
-        dest: /etc/nginx/sites-available/default
+        dest: /etc/nginx/sites-available/app
         mode: "0644"
         content: |
           server {
-            listen 80 default_server;
-            server_name _;
+            listen 80;
+            server_name {{ domain }} {{ domain_alt }};
 
             location / {
-              proxy_pass         http://127.0.0.1:8000;
+              proxy_pass         http://127.0.0.1:{{ app_port }};
               proxy_set_header   Host $host;
               proxy_set_header   X-Real-IP $remote_addr;
               proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header   X-Forwarded-Proto $scheme;
               proxy_read_timeout 60s;
             }
           }
-      notify: Restart nginx
+      notify: Reload nginx
+
+    - name: Enable app site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+
+    - name: Remove default nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
 
     - name: Flush handlers
       ansible.builtin.meta: flush_handlers
@@ -103,9 +127,41 @@
         state: started
         enabled: true
 
-    - name: Wait for app to be listening on port 8000
+    - name: Wait for app to be listening on port {{ app_port }}
       ansible.builtin.wait_for:
-        port: 8000
+        port: "{{ app_port }}"
+        host: 127.0.0.1
+        timeout: 60
+
+    # ── certbot: obtain cert + auto-configure nginx for HTTPS + HTTP→HTTPS redirect ──
+    - name: Obtain / renew TLS certificate with certbot
+      ansible.builtin.command:
+        cmd: >
+          certbot --nginx --non-interactive --agree-tos
+          --email admin@hepttech.com
+          -d {{ domain }} -d {{ domain_alt }}
+          --redirect
+        creates: /etc/letsencrypt/live/{{ domain }}/fullchain.pem
+      notify: Reload nginx
+
+    - name: Flush handlers after certbot
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable certbot systemd timer (auto-renewal)
+      ansible.builtin.systemd:
+        name: certbot.timer
+        state: started
+        enabled: true
+
+    - name: Ensure nginx is reloaded and running after TLS config
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Wait for HTTPS to be available on port 443
+      ansible.builtin.wait_for:
+        port: 443
         host: 127.0.0.1
         timeout: 60
 
@@ -120,8 +176,13 @@
         state: restarted
         enabled: true
 
-    - name: Restart nginx
+    - name: Reload nginx
+      ansible.builtin.command:
+        cmd: nginx -t
+      changed_when: false
+      notify: Actually reload nginx
+
+    - name: Actually reload nginx
       ansible.builtin.systemd:
         name: nginx
-        state: restarted
-        enabled: true
+        state: reloaded
