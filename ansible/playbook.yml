@@ -1,0 +1,127 @@
+---
+- name: Configure FastAPI application server
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Wait for SSH to be ready
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 120
+
+    - name: Install runtime packages
+      ansible.builtin.apt:
+        name: [python3-venv, python3-pip, nginx]
+        state: present
+        update_cache: true
+      retries: 5
+      delay: 10
+      register: apt_result
+      until: apt_result is succeeded
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: /opt/app
+        state: directory
+        mode: "0755"
+
+    - name: Copy application source
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../app/"
+        dest: /opt/app/app/
+        mode: "0644"
+
+    - name: Copy requirements
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../requirements.txt"
+        dest: /opt/app/requirements.txt
+        mode: "0644"
+
+    - name: Create virtualenv
+      ansible.builtin.command:
+        cmd: python3 -m venv /opt/app/venv
+        creates: /opt/app/venv/bin/python
+
+    - name: Install Python dependencies into the venv
+      ansible.builtin.command:
+        cmd: /opt/app/venv/bin/pip install --quiet -r /opt/app/requirements.txt
+      changed_when: true
+
+    - name: Install systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/app.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=FastAPI application — pythonnurr
+          After=network.target
+
+          [Service]
+          WorkingDirectory=/opt/app
+          ExecStart=/opt/app/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - Reload systemd
+        - Restart app
+
+    - name: Install nginx site
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/default
+        mode: "0644"
+        content: |
+          server {
+            listen 80 default_server;
+            server_name _;
+
+            location / {
+              proxy_pass         http://127.0.0.1:8000;
+              proxy_set_header   Host $host;
+              proxy_set_header   X-Real-IP $remote_addr;
+              proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_read_timeout 60s;
+            }
+          }
+      notify: Restart nginx
+
+    - name: Flush handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Ensure app service is started and enabled
+      ansible.builtin.systemd:
+        name: app
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Ensure nginx is started and enabled
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Wait for app to be listening on port 8000
+      ansible.builtin.wait_for:
+        port: 8000
+        host: 127.0.0.1
+        timeout: 60
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart app
+      ansible.builtin.systemd:
+        name: app
+        state: restarted
+        enabled: true
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+        enabled: true
